@@ -1,0 +1,53 @@
+<!doctype html>
+<html>
+<head>
+  <title>Alarm Status</title>
+  <meta http-equiv="refresh" content="1">
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    .status { font-size: 1.5em; }
+    .enabled { color: green; }
+    .disabled { color: red; }
+    .latched { color: red; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>Alarm System Status</h1>
+
+  <p class="status">
+    Alarm:
+    {% if systemEnabled %}
+      <span class="enabled">ENABLED</span>
+    {% else %}
+      <span class="disabled">DISABLED</span>
+    {% endif %}
+  </p>
+
+  <p>
+    Intruder status:
+    {% if alarmLatched %}
+      <span class="latched">{{ last_intruder }}</span>
+    {% else %}
+      {{ last_intruder }}
+    {% endif %}
+  </p>
+
+  <p>Last door/window event: {{ last_door_event }}</p>
+
+  <p>Ultrasonic status: {{ last_ultra }}</p>
+  <p>Last distance (cm): {{ last_distance_cm }}</p>
+  <p>Last update: {{ last_update }}</p>
+
+  <h2>Door / Window status</h2>
+  <p>{{ door1_label }}: {{ door1_status }}</p>
+  <p>{{ door2_label }}: {{ door2_status }}</p>
+  <p>{{ door3_label }}: {{ door3_status }}</p>
+
+  <h2>Controls</h2>
+  <form method="post" action="/control">
+    <button type="submit" name="action" value="arm">Arm alarm</button>
+    <button type="submit" name="action" value="disarm">Disarm alarm</button>
+  </form>
+</body>
+</html>
+
