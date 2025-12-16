@@ -1,0 +1,278 @@
+
+#!/usr/bin/python3
+
+from flask import Flask, render_template, request, redirect
+import threading
+import time
+import os
+import json
+import paho.mqtt.client as mqtt
+
+BROKER = "broker.emqx.io"
+PORT = 1883
+
+TOPIC_DOOR1 = "alarm/sensor/door1"
+TOPIC_DOOR2 = "alarm/sensor/door2"
+TOPIC_DOOR3 = "alarm/sensor/door3"
+TOPIC_ULTRA = "alarm/sensor/ultra/distance"
+TOPIC_RFID  = "alarm/sensor/rfid"
+TOPIC_BUZZER = "alarm/actuator/buzzer"
+
+client = None
+
+RULES_PATH = os.path.join(os.path.dirname(__file__), "rules.json")
+with open(RULES_PATH, "r") as f:
+    RULES = json.load(f)
+
+# Ultrasonic rules
+ULTRA_ENABLED = RULES["ultrasonic"]["enabled"]
+ULTRA_THRESHOLD_CM = RULES["ultrasonic"]["threshold_cm"]
+ULTRA_HOLD_SECONDS = RULES["ultrasonic"]["hold_seconds"]
+ULTRA_MSG_SOMEONE = RULES["ultrasonic"]["message_someone"]
+ULTRA_MSG_NO_ONE = RULES["ultrasonic"]["message_no_one"]
+
+# Door/window rules
+DW_REQUIRE_ALL_CLOSED = RULES["doors_windows"]["require_all_closed_to_arm"]
+DW_INTRUDER_ON_OPEN   = RULES["doors_windows"]["intruder_on_open_when_armed"]
+DW_INTRUDER_MESSAGE   = RULES["doors_windows"]["intruder_message"]
+DW_CANNOT_ARM_MESSAGE = RULES["doors_windows"]["cannot_arm_message"]
+DW_LABEL1 = RULES["doors_windows"]["door1_label"]
+DW_LABEL2 = RULES["doors_windows"]["door2_label"]
+DW_LABEL3 = RULES["doors_windows"]["door3_label"]
+
+# Buzzer rules
+BEEP_ON_ARM    = RULES["buzzer"]["beep_on_arm"]
+BEEP_ON_DISARM = RULES["buzzer"]["beep_on_disarm"]
+
+# RFID rules
+RFID_ENABLED      = RULES["rfid"]["enabled"]
+RFID_ALLOWED_UIDS = RULES["rfid"]["allowed_uids"]
+RFID_ACTION       = RULES["rfid"]["action"]  # "toggle", "arm", or "disarm"
+
+# ================== ALARM STATE ==================
+
+systemEnabled = False
+alarmLatched  = False
+
+# Start as closed so web never shows "unknown"
+door1_status = "closed"   # front door
+door2_status = "closed"   # window 1
+door3_status = "closed"   # window 2
+
+last_distance_cm = None
+ultraPresence    = False
+ultraBelowSince  = 0
+
+last_intruder   = "none"
+last_ultra      = "none"
+last_update     = "never"
+last_door_event = "none"
+
+state_lock = threading.Lock()
+
+# ================== HELPERS: ARM / DISARM =========
+
+def do_arm():
+    global systemEnabled, alarmLatched, ultraPresence, ultraBelowSince
+    global last_intruder, last_ultra, last_update
+
+    if DW_REQUIRE_ALL_CLOSED:
+        all_closed = (door1_status == "closed" and
+                      door2_status == "closed" and
+                      door3_status == "closed")
+    else:
+        all_closed = True
+
+    if all_closed:
+        systemEnabled = True
+        alarmLatched = False
+        ultraPresence = False
+        ultraBelowSince = 0
+        last_intruder = "none"
+        last_ultra = ULTRA_MSG_NO_ONE
+        # Single beep on arm
+        if client is not None and BEEP_ON_ARM:
+            client.publish(TOPIC_BUZZER, "beep1")
+    else:
+        last_intruder = DW_CANNOT_ARM_MESSAGE
+
+    last_update = time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def do_disarm():
+    global systemEnabled, alarmLatched, ultraPresence, ultraBelowSince
+    global last_intruder, last_ultra, last_update
+
+    systemEnabled = False
+    alarmLatched = False
+    ultraPresence = False
+    ultraBelowSince = 0
+    last_intruder = "none"
+    last_ultra = ULTRA_MSG_NO_ONE
+
+    if client is not None:
+        client.publish(TOPIC_BUZZER, "off")
+        # Double beep on disarm
+        if BEEP_ON_DISARM:
+            client.publish(TOPIC_BUZZER, "beep2")
+
+    last_update = time.strftime("%Y-%m-%d %H:%M:%S")
+
+# ================== MQTT CALLBACKS ==================
+
+def on_connect(c, userdata, flags, reason_code, properties=None):
+    print("MQTT connected with code:", reason_code)
+    c.subscribe(TOPIC_DOOR1)
+    c.subscribe(TOPIC_DOOR2)
+    c.subscribe(TOPIC_DOOR3)
+    c.subscribe(TOPIC_ULTRA)
+    c.subscribe(TOPIC_RFID)
+
+
+def on_message(c, userdata, msg):
+    global door1_status, door2_status, door3_status
+    global last_distance_cm, ultraPresence, ultraBelowSince
+    global alarmLatched, last_intruder, last_ultra, last_update, last_door_event
+    global systemEnabled
+
+    try:
+        payload = msg.payload.decode().strip()
+    except UnicodeDecodeError:
+        payload = str(msg.payload)
+
+    now = time.time()
+
+    with state_lock:
+        # ----- Doors / windows -----
+        if msg.topic == TOPIC_DOOR1:
+            prev = door1_status
+            door1_status = payload
+            if prev == "closed" and door1_status == "open":
+                last_door_event = f"{DW_LABEL1} opened"
+
+        elif msg.topic == TOPIC_DOOR2:
+            prev = door2_status
+            door2_status = payload
+            if prev == "closed" and door2_status == "open":
+                last_door_event = f"{DW_LABEL2} opened"
+
+        elif msg.topic == TOPIC_DOOR3:
+            prev = door3_status
+            door3_status = payload
+            if prev == "closed" and door3_status == "open":
+                last_door_event = f"{DW_LABEL3} opened"
+
+        # Intruder latch on any open when armed
+        if systemEnabled and DW_INTRUDER_ON_OPEN:
+            if door1_status == "open" or door2_status == "open" or door3_status == "open":
+                if not alarmLatched:
+                    alarmLatched = True
+                    last_intruder = DW_INTRUDER_MESSAGE
+                    if client is not None:
+                        client.publish(TOPIC_BUZZER, "alarm")
+
+        # ----- Ultrasonic -----
+        if msg.topic == TOPIC_ULTRA:
+            if payload == "out_of_range":
+                last_distance_cm = None
+            else:
+                try:
+                    last_distance_cm = float(payload)
+                except ValueError:
+                    last_distance_cm = None
+
+            if (ULTRA_ENABLED and systemEnabled
+                    and last_distance_cm is not None and last_distance_cm > 0):
+                if last_distance_cm <= ULTRA_THRESHOLD_CM:
+                    if ultraBelowSince == 0:
+                        ultraBelowSince = now
+                    else:
+                        if ((now - ultraBelowSince) >= ULTRA_HOLD_SECONDS
+                                and not ultraPresence):
+                            ultraPresence = True
+                            last_ultra = ULTRA_MSG_SOMEONE
+                else:
+                    ultraBelowSince = 0
+                    if ultraPresence:
+                        ultraPresence = False
+                        last_ultra = ULTRA_MSG_NO_ONE
+            else:
+                ultraBelowSince = 0
+                if ultraPresence:
+                    ultraPresence = False
+                    last_ultra = ULTRA_MSG_NO_ONE
+
+        # ----- RFID -----
+        elif msg.topic == TOPIC_RFID and RFID_ENABLED:
+            uid = payload
+            print("RFID UID received:", uid)
+            if uid in RFID_ALLOWED_UIDS:
+                if RFID_ACTION == "toggle":
+                    if systemEnabled:
+                        do_disarm()
+                    else:
+                        do_arm()
+                elif RFID_ACTION == "arm":
+                    do_arm()
+                elif RFID_ACTION == "disarm":
+                    do_disarm()
+            else:
+                last_intruder = "Unauthorized tag detected"
+                last_update = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        last_update = time.strftime("%Y-%m-%d %H:%M:%S")
+
+# ================== MQTT THREAD ==================
+
+def start_mqtt():
+    global client
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.connect(BROKER, PORT, 60)
+    client.loop_forever()
+
+# ================== FLASK APP ==================
+
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    with state_lock:
+        data = dict(
+            systemEnabled=systemEnabled,
+            alarmLatched=alarmLatched,
+            door1_status=door1_status,
+            door2_status=door2_status,
+            door3_status=door3_status,
+            door1_label=DW_LABEL1,
+            door2_label=DW_LABEL2,
+            door3_label=DW_LABEL3,
+            last_distance_cm=last_distance_cm,
+            ultraPresence=ultraPresence,
+            last_intruder=last_intruder,
+            last_ultra=last_ultra,
+            last_update=last_update,
+            last_door_event=last_door_event,
+        )
+    return render_template("index.html", **data)
+
+@app.route("/control", methods=["POST"])
+def control():
+    action = request.form.get("action")
+    with state_lock:
+        if action == "arm":
+            do_arm()
+        elif action == "disarm":
+            do_disarm()
+    return redirect("/")
+
+@app.route("/ping")
+def ping():
+    return "ok"
+
+if __name__ == "__main__":
+    t = threading.Thread(target=start_mqtt, daemon=True)
+    t.start()
+    app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False)
+
