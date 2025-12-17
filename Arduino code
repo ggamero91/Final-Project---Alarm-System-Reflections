@@ -1,0 +1,320 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+// WiFi credentials
+const char* ssid     = "NOPE";
+const char* password = "Honduras514";
+
+// MQTT broker
+const char* mqtt_server = "broker.emqx.io";
+const uint16_t mqtt_port = 1883;
+
+// MQTT topics
+const char* MQTT_DOOR1_TOPIC      = "alarm/sensor/door1";
+const char* MQTT_DOOR2_TOPIC      = "alarm/sensor/door2";
+const char* MQTT_DOOR3_TOPIC      = "alarm/sensor/door3";
+const char* MQTT_ULTRA_TOPIC      = "alarm/sensor/ultra/distance";
+const char* MQTT_BUZZER_CMD_TOPIC = "alarm/actuator/buzzer";
+const char* MQTT_RFID_TOPIC       = "alarm/sensor/rfid";
+
+// Pins
+#define DOOR1_PIN 27
+#define DOOR2_PIN 26
+#define DOOR3_PIN 25
+#define BUZZER_PIN 14
+#define TRIG_PIN 12
+#define ECHO_PIN 35
+#define RST_PIN 22
+#define SS_PIN  5
+
+MFRC522 mfrc(SS_PIN, RST_PIN);
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+bool lastDoor1Open = false;
+bool lastDoor2Open = false;
+bool lastDoor3Open = false;
+
+enum BuzzerMode {
+  BUZZER_OFF,
+  BUZZER_BEEP_SINGLE,
+  BUZZER_BEEP_DOUBLE,
+  BUZZER_ALARM
+};
+
+
+BuzzerMode buzzerMode = BUZZER_OFF;
+unsigned long lastAlarmToggle = 0;
+bool alarmBuzzerState = false;
+
+void connectWiFi();
+void connectMQTT();
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+float readUltrasonic();
+void updateDoors();
+void handleBuzzer();
+void checkRFIDAndPublish();
+
+// ---------- WiFi ----------
+
+void connectWiFi() {
+  Serial.println("Starting WiFi connect...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 40) {
+    delay(500);
+    Serial.print(".");
+    retries++;
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.print("WiFi failed, status = ");
+    Serial.println(WiFi.status());
+  }
+}
+
+// ---------- MQTT ----------
+
+void connectMQTT() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("MQTT: WiFi not connected, skipping MQTT connect");
+    return;
+  }
+
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  Serial.println("Connecting to MQTT...");
+
+  while (!mqttClient.connected()) {
+    String clientId = "ESP32AlarmNode-";
+    clientId += String((uint32_t)ESP.getEfuseMac(), HEX);
+
+    Serial.print("MQTT connecting as ");
+    Serial.println(clientId);
+
+    if (mqttClient.connect(clientId.c_str())) {
+      Serial.println("MQTT connected!");
+
+      bool ok = mqttClient.subscribe(MQTT_BUZZER_CMD_TOPIC);
+      Serial.print("Subscribed to buzzer cmd: ");
+      Serial.println(ok ? "OK" : "FAILED");
+
+      // ===== ONE-TIME INITIAL SCAN / PUBLISH =====
+      bool d1_open = (digitalRead(DOOR1_PIN) == HIGH);
+      bool d2_open = (digitalRead(DOOR2_PIN) == HIGH);
+      bool d3_open = (digitalRead(DOOR3_PIN) == HIGH);
+
+      lastDoor1Open = d1_open;
+      lastDoor2Open = d2_open;
+      lastDoor3Open = d3_open;
+
+      mqttClient.publish(MQTT_DOOR1_TOPIC, d1_open ? "open" : "closed");
+      mqttClient.publish(MQTT_DOOR2_TOPIC, d2_open ? "open" : "closed");
+      mqttClient.publish(MQTT_DOOR3_TOPIC, d3_open ? "open" : "closed");
+
+      Serial.print("Initial door1: "); Serial.println(d1_open ? "open" : "closed");
+      Serial.print("Initial door2: "); Serial.println(d2_open ? "open" : "closed");
+      Serial.print("Initial door3: "); Serial.println(d3_open ? "open" : "closed");
+      // ===========================================
+    } else {
+      Serial.print("MQTT connect failed, rc = ");
+      Serial.println(mqttClient.state());
+      Serial.println("Retrying in 2 seconds...");
+      delay(2000);
+    }
+  }
+}
+
+// ---------- SETUP ----------
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(DOOR1_PIN, INPUT_PULLUP);
+  pinMode(DOOR2_PIN, INPUT_PULLUP);
+  pinMode(DOOR3_PIN, INPUT_PULLUP);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  SPI.begin(18, 19, 23, SS_PIN);
+  mfrc.PCD_Init();
+
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(200);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  connectWiFi();
+  mqttClient.setCallback(mqttCallback);
+  connectMQTT();
+
+  Serial.println("Hardware-only node ready.");
+}
+
+// ---------- LOOP ----------
+
+void loop() {
+  if (!mqttClient.connected()) {
+    connectMQTT();
+  }
+  mqttClient.loop();
+
+  updateDoors();
+
+  float distance = readUltrasonic();
+  if (mqttClient.connected()) {
+    if (distance > 0) {
+      char buf[16];
+      dtostrf(distance, 1, 1, buf);
+      mqttClient.publish(MQTT_ULTRA_TOPIC, buf);
+    } else {
+      mqttClient.publish(MQTT_ULTRA_TOPIC, "out_of_range");
+    }
+  }
+
+  handleBuzzer();
+  checkRFIDAndPublish();
+
+  delay(100);
+}
+
+// ---------- DOORS ----------
+
+void updateDoors() {
+  bool d1_open = (digitalRead(DOOR1_PIN) == HIGH);
+  bool d2_open = (digitalRead(DOOR2_PIN) == HIGH);
+  bool d3_open = (digitalRead(DOOR3_PIN) == HIGH);
+
+  if (d1_open != lastDoor1Open && mqttClient.connected()) {
+    mqttClient.publish(MQTT_DOOR1_TOPIC, d1_open ? "open" : "closed");
+    lastDoor1Open = d1_open;
+    Serial.print("Front door: ");
+    Serial.println(d1_open ? "open" : "closed");
+  }
+
+  if (d2_open != lastDoor2Open && mqttClient.connected()) {
+    mqttClient.publish(MQTT_DOOR2_TOPIC, d2_open ? "open" : "closed");
+    lastDoor2Open = d2_open;
+    Serial.print("Window 1: ");
+    Serial.println(d2_open ? "open" : "closed");
+  }
+
+  if (d3_open != lastDoor3Open && mqttClient.connected()) {
+    mqttClient.publish(MQTT_DOOR3_TOPIC, d3_open ? "open" : "closed");
+    lastDoor3Open = d3_open;
+    Serial.print("Window 2: ");
+    Serial.println(d3_open ? "open" : "closed");
+  }
+}
+
+// ---------- ULTRASONIC ----------
+
+float readUltrasonic() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(5);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 25000);
+  if (duration == 0) return -1;
+  return (duration / 2.0) / 29.1;
+}
+
+// ---------- RFID ----------
+
+void checkRFIDAndPublish() {
+  if (!mfrc.PICC_IsNewCardPresent()) return;
+  if (!mfrc.PICC_ReadCardSerial()) return;
+
+  String uidStr = "";
+  for (byte i = 0; i < mfrc.uid.size; i++) {
+    if (i > 0) uidStr += "-";
+    if (mfrc.uid.uidByte[i] < 0x10) uidStr += "0";
+    uidStr += String(mfrc.uid.uidByte[i], HEX);
+  }
+  uidStr.toUpperCase();
+
+  Serial.print("RFID UID: ");
+  Serial.println(uidStr);
+
+  if (mqttClient.connected()) {
+    mqttClient.publish(MQTT_RFID_TOPIC, uidStr.c_str());
+  }
+
+  mfrc.PICC_HaltA();
+}
+
+// ---------- BUZZER ----------
+
+void handleBuzzer() {
+  unsigned long now = millis();
+
+  switch (buzzerMode) {
+    case BUZZER_OFF:
+      digitalWrite(BUZZER_PIN, LOW);
+      break;
+
+    case BUZZER_BEEP_SINGLE:
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(150);
+      digitalWrite(BUZZER_PIN, LOW);
+      buzzerMode = BUZZER_OFF;
+      break;
+
+    case BUZZER_BEEP_DOUBLE:
+      for (int i = 0; i < 2; i++) {
+        digitalWrite(BUZZER_PIN, HIGH);
+        delay(120);
+        digitalWrite(BUZZER_PIN, LOW);
+        delay(80);
+      }
+      buzzerMode = BUZZER_OFF;
+      break;
+
+    case BUZZER_ALARM:
+      if (now - lastAlarmToggle >= 400) {
+        lastAlarmToggle = now;
+        alarmBuzzerState = !alarmBuzzerState;
+        digitalWrite(BUZZER_PIN, alarmBuzzerState ? HIGH : LOW);
+      }
+      break;
+  }
+}
+
+
+// ---------- MQTT CALLBACK ----------
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String t = String(topic);
+  String msg;
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  msg.trim();
+
+  if (t == MQTT_BUZZER_CMD_TOPIC) {
+    if (msg.equalsIgnoreCase("off")) {
+      buzzerMode = BUZZER_OFF;
+    } else if (msg.equalsIgnoreCase("beep1")) {
+      buzzerMode = BUZZER_BEEP_SINGLE;
+    } else if (msg.equalsIgnoreCase("beep2")) {
+      buzzerMode = BUZZER_BEEP_DOUBLE;
+    } else if (msg.equalsIgnoreCase("alarm")) {
+      buzzerMode = BUZZER_ALARM;
+      lastAlarmToggle = millis();
+      alarmBuzzerState = false;
+    }
+  }
+}
+
