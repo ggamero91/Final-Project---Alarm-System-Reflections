@@ -1,0 +1,30 @@
+{
+  "ultrasonic": {
+    "enabled": true,
+    "threshold_cm": 10.0,
+    "hold_seconds": 3,
+    "message_someone": "Someone's at the door",
+    "message_no_one": "No one at the door"
+  },
+  "doors_windows": {
+    "require_all_closed_to_arm": true,
+    "intruder_on_open_when_armed": true,
+    "intruder_message": "Intruder Alert (door or window opened)",
+    "cannot_arm_message": "Cannot arm: at least one door/window is open.",
+    "door1_label": "Front door",
+    "door2_label": "Window 1",
+    "door3_label": "Window 2"
+  },
+  "buzzer": {
+    "beep_on_arm": true,
+    "beep_on_disarm": true
+  },
+  "rfid": {
+    "enabled": true,
+    "allowed_uids": [
+      "92-7A-2F-02"
+    ],
+    "action": "toggle"
+  }
+}
+
